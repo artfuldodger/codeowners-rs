@@ -376,3 +376,80 @@ fn test_validate_respects_unowned_globs() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+// The three tests below cover the batched CODEOWNERS query specifically: results come
+// back in a map keyed by project-relative path, so they exercise multiple keys, a
+// collapsed duplicate key, and two different original strings sharing one key.
+
+#[test]
+fn test_validate_reports_every_unowned_file_in_one_invocation() -> Result<(), Box<dyn Error>> {
+    // More than one unowned path in a single call, mixed with an owned one. The batch
+    // returns a map, so this checks no entry is dropped and the owned file stays absent.
+    run_codeowners(
+        "valid_project",
+        &[
+            "validate",
+            "ruby/app/first_unowned.rb",
+            "ruby/app/models/payroll.rb",
+            "ruby/app/second_unowned.rb",
+        ],
+        false,
+        OutputStream::Stdout,
+        predicate::str::contains("ruby/app/first_unowned.rb")
+            .and(predicate::str::contains("ruby/app/second_unowned.rb"))
+            .and(predicate::str::contains("models/payroll.rb").not()),
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_validate_handles_the_same_path_passed_twice() -> Result<(), Box<dyn Error>> {
+    // Duplicate paths collapse to a single key in the results map. The file must still
+    // be reported rather than lost to the dedup.
+    run_codeowners(
+        "valid_project",
+        &["validate", "ruby/app/unowned.rb", "ruby/app/unowned.rb"],
+        false,
+        OutputStream::Stdout,
+        predicate::str::contains("ruby/app/unowned.rb").and(predicate::str::contains("Unowned")),
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn test_validate_reports_absolute_and_relative_paths_as_given() -> Result<(), Box<dyn Error>> {
+    // An absolute and a relative path to the same file share one relative key. Each must
+    // be echoed back in the form the caller supplied, not regenerated from the key.
+    let fixture_root = std::path::Path::new("tests/fixtures/valid_project");
+    let temp_dir = setup_fixture_repo(fixture_root);
+    let project_root = temp_dir.path();
+
+    // Must exist on disk to be canonicalized below, and absent from CODEOWNERS so it
+    // comes back unowned.
+    std::fs::write(project_root.join("ruby/app/unowned.rb"), "# no owner")?;
+    git_add_all_files(project_root);
+
+    // Canonicalized to match the project root, which the CLI canonicalizes. A
+    // non-canonical absolute path fails to relativize and is then dropped by the
+    // owned_globs filter before it ever reaches the query.
+    let absolute = project_root.join("ruby/app/unowned.rb").canonicalize()?;
+
+    Command::cargo_bin("codeowners")?
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--no-cache")
+        .arg("validate")
+        .arg(absolute.to_str().unwrap())
+        .arg("ruby/app/unowned.rb")
+        .assert()
+        .failure()
+        // The absolute form, reported verbatim.
+        .stdout(predicate::str::contains(absolute.to_str().unwrap()))
+        // The relative form. The leading indent distinguishes it from the absolute
+        // line, which also ends in this same substring.
+        .stdout(predicate::str::contains("  ruby/app/unowned.rb"));
+
+    Ok(())
+}

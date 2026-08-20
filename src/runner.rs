@@ -143,36 +143,71 @@ impl Runner {
     }
 
     fn validate_files(&self, file_paths: Vec<String>) -> RunResult {
-        let mut unowned_files = Vec::new();
-        let mut io_errors = Vec::new();
-
         // Filter files based on owned_globs and unowned_globs configuration
         // Only validate files that match owned_globs and don't match unowned_globs
-        let filtered_paths: Vec<String> = file_paths
+        //
+        // Each surviving path is kept alongside its project-relative form: the
+        // relative form is what the CODEOWNERS query is keyed by, while the
+        // original is what gets reported back to the caller.
+        let (original_paths, relative_paths): (Vec<String>, Vec<String>) = file_paths
             .into_iter()
-            .filter(|file_path| {
-                // Convert to relative path for glob matching
-                let path = Path::new(file_path);
-                let relative_path = if path.is_absolute() {
-                    path.strip_prefix(&self.run_config.project_root).unwrap_or(path)
-                } else {
-                    path
-                };
+            .filter_map(|file_path| {
+                // Relativize with the same helper the CODEOWNERS query uses. The query
+                // keys its result map by this form, so the two must agree exactly --
+                // otherwise the lookups below miss silently and report owned files as
+                // unowned.
+                let relative_path = crate::path_utils::relative_to(&self.run_config.project_root, Path::new(&file_path));
 
                 // Mirror the filtering applied by ProjectBuilder when walking the project
-                matches_globs(relative_path, &self.config.owned_globs) && !matches_globs(relative_path, &self.config.unowned_globs)
-            })
-            .collect();
-
-        debug_span!("per_file_query").in_scope(|| {
-            for file_path in filtered_paths {
-                match team_for_file_from_codeowners(&self.run_config, &file_path) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => unowned_files.push(file_path),
-                    Err(err) => io_errors.push(format!("{}: {}", file_path, err)),
+                if matches_globs(relative_path, &self.config.owned_globs) && !matches_globs(relative_path, &self.config.unowned_globs) {
+                    let relative = relative_path.to_string_lossy().into_owned();
+                    Some((file_path, relative))
+                } else {
+                    None
                 }
+            })
+            .unzip();
+
+        if relative_paths.is_empty() {
+            return RunResult::default();
+        }
+
+        // One batched query for every path, rather than one query per path. The
+        // per-path version re-read and re-parsed the entire CODEOWNERS file every
+        // time, because `parse_codeowners_entries` is not memoized. The batch
+        // function already parallelizes across the paths it is given.
+        //
+        // This calls the inner query rather than the `runner::api` wrapper on
+        // purpose: the wrapper reloads the config on every call, which is the other
+        // half of the per-path cost.
+        let teams = match debug_span!("per_file_query").in_scope(|| {
+            crate::ownership::codeowners_query::teams_for_files_from_codeowners(
+                &self.run_config.project_root,
+                &self.codeowners_file_path,
+                &self.config.team_file_glob,
+                &relative_paths,
+            )
+        }) {
+            Ok(teams) => teams,
+            // Kept for completeness rather than because it fires: the only failure the
+            // query reports is a non-UTF-8 path, and these have already been through
+            // `to_string_lossy`. Note that an unreadable CODEOWNERS is not an error on
+            // this path at all -- the parser logs it and yields no entries, so every
+            // path is reported unowned instead.
+            Err(err) => {
+                return RunResult {
+                    io_errors: vec![err],
+                    ..Default::default()
+                };
             }
-        });
+        };
+
+        // Report the caller's original path string, not the relative key, so absolute
+        // paths render as the caller wrote them.
+        let unowned_files: Vec<String> = std::iter::zip(original_paths, &relative_paths)
+            .filter(|(_, relative)| teams.get(relative.as_str()).is_none_or(Option::is_none))
+            .map(|(original, _)| original)
+            .collect();
 
         if !unowned_files.is_empty() {
             let validation_errors = std::iter::once("Unowned files detected:".to_string())
@@ -181,14 +216,6 @@ impl Runner {
 
             return RunResult {
                 validation_errors,
-                io_errors,
-                ..Default::default()
-            };
-        }
-
-        if !io_errors.is_empty() {
-            return RunResult {
-                io_errors,
                 ..Default::default()
             };
         }
