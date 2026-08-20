@@ -85,16 +85,17 @@ pub(crate) fn resolve_codeowners_file_path(run_config: &RunConfig, config: &Conf
 /// needs no `Project` and therefore no project build. Lives outside `Runner` so
 /// the `validate <files>` entry point can call it without constructing one.
 pub(crate) fn validate_file_paths(run_config: &RunConfig, config: &Config, file_paths: Vec<String>) -> RunResult {
-    let mut unowned_files = Vec::new();
-    let mut io_errors = Vec::new();
-
     // Filter files based on owned_globs and unowned_globs configuration
     // Only validate files that match owned_globs and don't match unowned_globs
-    let filtered_paths: Vec<String> = file_paths
+    //
+    // Each surviving path is kept alongside its project-relative form: the
+    // relative form is what the CODEOWNERS query is keyed by, while the original
+    // is what gets reported back to the caller.
+    let filtered: Vec<(String, String)> = file_paths
         .into_iter()
-        .filter(|file_path| {
+        .filter_map(|file_path| {
             // Convert to relative path for glob matching
-            let path = Path::new(file_path);
+            let path = Path::new(&file_path);
             let relative_path = if path.is_absolute() {
                 path.strip_prefix(&run_config.project_root).unwrap_or(path)
             } else {
@@ -102,19 +103,51 @@ pub(crate) fn validate_file_paths(run_config: &RunConfig, config: &Config, file_
             };
 
             // Mirror the filtering applied by ProjectBuilder when walking the project
-            matches_globs(relative_path, &config.owned_globs) && !matches_globs(relative_path, &config.unowned_globs)
+            if matches_globs(relative_path, &config.owned_globs) && !matches_globs(relative_path, &config.unowned_globs) {
+                let relative = relative_path.to_string_lossy().into_owned();
+                Some((file_path, relative))
+            } else {
+                None
+            }
         })
         .collect();
 
-    debug_span!("per_file_query").in_scope(|| {
-        for file_path in filtered_paths {
-            match team_for_file_from_codeowners(run_config, &file_path) {
-                Ok(Some(_)) => {}
-                Ok(None) => unowned_files.push(file_path),
-                Err(err) => io_errors.push(format!("{}: {}", file_path, err)),
-            }
+    if filtered.is_empty() {
+        return RunResult::default();
+    }
+
+    // One batched query for every path, rather than one query per path. The
+    // per-path version re-read and re-parsed the entire CODEOWNERS file each time
+    // (`parse_codeowners_entries` is not memoized), costing ~9.5ms per file
+    // against an 18k-line CODEOWNERS. The batch function already parallelizes
+    // across the paths it is given.
+    let codeowners_file_path = resolve_codeowners_file_path(run_config, config);
+    let relative_paths: Vec<String> = filtered.iter().map(|(_, relative)| relative.clone()).collect();
+    let teams = match debug_span!("per_file_query").in_scope(|| {
+        crate::ownership::codeowners_query::teams_for_files_from_codeowners(
+            &run_config.project_root,
+            &codeowners_file_path,
+            &config.team_file_glob,
+            &relative_paths,
+        )
+    }) {
+        Ok(teams) => teams,
+        // The per-path loop could attribute an IO failure to one specific file. A
+        // batched read either succeeds or fails for the whole set, so the error is
+        // no longer per-path.
+        Err(err) => {
+            return RunResult {
+                io_errors: vec![err],
+                ..Default::default()
+            };
         }
-    });
+    };
+
+    let unowned_files: Vec<String> = filtered
+        .into_iter()
+        .filter(|(_, relative)| teams.get(relative).is_none_or(Option::is_none))
+        .map(|(original, _)| original)
+        .collect();
 
     if !unowned_files.is_empty() {
         let validation_errors = std::iter::once("Unowned files detected:".to_string())
@@ -123,14 +156,6 @@ pub(crate) fn validate_file_paths(run_config: &RunConfig, config: &Config, file_
 
         return RunResult {
             validation_errors,
-            io_errors,
-            ..Default::default()
-        };
-    }
-
-    if !io_errors.is_empty() {
-        return RunResult {
-            io_errors,
             ..Default::default()
         };
     }
