@@ -79,6 +79,65 @@ pub(crate) fn resolve_codeowners_file_path(run_config: &RunConfig, config: &Conf
     run_config.project_root.join(&config.codeowners_path).join("CODEOWNERS")
 }
 
+/// Validates ownership for an explicit list of paths.
+///
+/// Resolves ownership entirely from the config and the CODEOWNERS file, so it
+/// needs no `Project` and therefore no project build. Lives outside `Runner` so
+/// the `validate <files>` entry point can call it without constructing one.
+pub(crate) fn validate_file_paths(run_config: &RunConfig, config: &Config, file_paths: Vec<String>) -> RunResult {
+    let mut unowned_files = Vec::new();
+    let mut io_errors = Vec::new();
+
+    // Filter files based on owned_globs and unowned_globs configuration
+    // Only validate files that match owned_globs and don't match unowned_globs
+    let filtered_paths: Vec<String> = file_paths
+        .into_iter()
+        .filter(|file_path| {
+            // Convert to relative path for glob matching
+            let path = Path::new(file_path);
+            let relative_path = if path.is_absolute() {
+                path.strip_prefix(&run_config.project_root).unwrap_or(path)
+            } else {
+                path
+            };
+
+            // Mirror the filtering applied by ProjectBuilder when walking the project
+            matches_globs(relative_path, &config.owned_globs) && !matches_globs(relative_path, &config.unowned_globs)
+        })
+        .collect();
+
+    debug_span!("per_file_query").in_scope(|| {
+        for file_path in filtered_paths {
+            match team_for_file_from_codeowners(run_config, &file_path) {
+                Ok(Some(_)) => {}
+                Ok(None) => unowned_files.push(file_path),
+                Err(err) => io_errors.push(format!("{}: {}", file_path, err)),
+            }
+        }
+    });
+
+    if !unowned_files.is_empty() {
+        let validation_errors = std::iter::once("Unowned files detected:".to_string())
+            .chain(unowned_files.into_iter().map(|file| format!("  {}", file)))
+            .collect();
+
+        return RunResult {
+            validation_errors,
+            io_errors,
+            ..Default::default()
+        };
+    }
+
+    if !io_errors.is_empty() {
+        return RunResult {
+            io_errors,
+            ..Default::default()
+        };
+    }
+
+    RunResult::default()
+}
+
 impl Runner {
     pub fn new(run_config: &RunConfig) -> Result<Self, Report<Error>> {
         let config = debug_span!("config_load").in_scope(|| config_from_run_config(run_config))?;
@@ -143,57 +202,7 @@ impl Runner {
     }
 
     fn validate_files(&self, file_paths: Vec<String>) -> RunResult {
-        let mut unowned_files = Vec::new();
-        let mut io_errors = Vec::new();
-
-        // Filter files based on owned_globs and unowned_globs configuration
-        // Only validate files that match owned_globs and don't match unowned_globs
-        let filtered_paths: Vec<String> = file_paths
-            .into_iter()
-            .filter(|file_path| {
-                // Convert to relative path for glob matching
-                let path = Path::new(file_path);
-                let relative_path = if path.is_absolute() {
-                    path.strip_prefix(&self.run_config.project_root).unwrap_or(path)
-                } else {
-                    path
-                };
-
-                // Mirror the filtering applied by ProjectBuilder when walking the project
-                matches_globs(relative_path, &self.config.owned_globs) && !matches_globs(relative_path, &self.config.unowned_globs)
-            })
-            .collect();
-
-        debug_span!("per_file_query").in_scope(|| {
-            for file_path in filtered_paths {
-                match team_for_file_from_codeowners(&self.run_config, &file_path) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => unowned_files.push(file_path),
-                    Err(err) => io_errors.push(format!("{}: {}", file_path, err)),
-                }
-            }
-        });
-
-        if !unowned_files.is_empty() {
-            let validation_errors = std::iter::once("Unowned files detected:".to_string())
-                .chain(unowned_files.into_iter().map(|file| format!("  {}", file)))
-                .collect();
-
-            return RunResult {
-                validation_errors,
-                io_errors,
-                ..Default::default()
-            };
-        }
-
-        if !io_errors.is_empty() {
-            return RunResult {
-                io_errors,
-                ..Default::default()
-            };
-        }
-
-        RunResult::default()
+        validate_file_paths(&self.run_config, &self.config, file_paths)
     }
 
     pub fn generate(&self, git_stage: bool) -> RunResult {

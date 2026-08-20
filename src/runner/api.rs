@@ -18,6 +18,22 @@ pub fn for_team(run_config: &RunConfig, team_name: &str) -> RunResult {
 }
 
 pub fn validate(run_config: &RunConfig, file_paths: Vec<String>) -> RunResult {
+    // Fast path for `validate <files>`. Ownership for an explicit path list is
+    // resolved from the config and the CODEOWNERS file alone, so building the
+    // whole project first — a full walk of every tracked file — is dead work.
+    //
+    // Tradeoff: this path no longer creates or persists the cache, so it does not
+    // warm it for a subsequent command, and it cannot surface project-build IO
+    // errors. `--no-cache` has no effect here.
+    if !file_paths.is_empty() {
+        return match config_from_run_config(run_config) {
+            Ok(config) => super::validate_file_paths(run_config, &config, file_paths),
+            Err(err) => RunResult {
+                io_errors: vec![format!("{:?}", err)],
+                ..Default::default()
+            },
+        };
+    }
     run(run_config, |runner| runner.validate(file_paths))
 }
 
