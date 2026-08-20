@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
 use super::mapper::{OwnerMatcher, Source, TeamName};
 
@@ -14,7 +14,11 @@ pub struct FileOwnerFinder<'a> {
 
 impl FileOwnerFinder<'_> {
     pub fn find(&self, relative_path: &Path) -> Vec<Owner> {
-        let mut team_sources_map: HashMap<&TeamName, Vec<Source>> = HashMap::new();
+        // A Vec rather than a HashMap: this runs once per file in the repo, and the
+        // number of owning teams for a single file is almost always 0 or 1 (more
+        // than 1 is a validation error). At that size a linear scan beats hashing,
+        // and an unowned file allocates nothing at all.
+        let mut team_sources: Vec<(&TeamName, Vec<Source>)> = Vec::new();
         let mut directory_overrider = DirectoryOverrider::default();
 
         for owner_matcher in self.owner_matchers {
@@ -26,7 +30,7 @@ impl FileOwnerFinder<'_> {
                         directory_overrider.process(team_name, source);
                     }
                     _ => {
-                        team_sources_map.entry(team_name).or_default().push(source.clone());
+                        push_source(&mut team_sources, team_name, source);
                     }
                 }
             }
@@ -34,16 +38,25 @@ impl FileOwnerFinder<'_> {
 
         // Add most specific directory owner if it exists
         if let Some((team_name, source)) = directory_overrider.specific_directory_owner() {
-            team_sources_map.entry(team_name).or_default().push(source.clone());
+            push_source(&mut team_sources, team_name, source);
         }
 
-        team_sources_map
+        team_sources
             .into_iter()
             .map(|(team_name, sources)| Owner {
                 sources,
                 team_name: team_name.clone(),
             })
             .collect()
+    }
+}
+
+/// Appends `source` to `team_name`'s entry, creating it if this is the first
+/// source seen for that team.
+fn push_source<'a>(team_sources: &mut Vec<(&'a TeamName, Vec<Source>)>, team_name: &'a TeamName, source: &Source) {
+    match team_sources.iter_mut().find(|(name, _)| *name == team_name) {
+        Some((_, sources)) => sources.push(source.clone()),
+        None => team_sources.push((team_name, vec![source.clone()])),
     }
 }
 
