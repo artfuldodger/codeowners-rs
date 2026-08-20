@@ -2,16 +2,19 @@ use std::cmp::Ordering;
 
 use super::{Entry, Mapper};
 
-pub struct FileGenerator {
-    pub mappers: Vec<Box<dyn Mapper>>,
-}
+/// Namespace for CODEOWNERS file generation.
+///
+/// Holds no state: `generate_file` borrows the mappers rather than owning a set,
+/// so a caller that already has them (like `Validator`) does not have to build a
+/// second identical set just to generate the file.
+pub struct FileGenerator;
 
 impl FileGenerator {
-    pub fn generate_file(&self) -> String {
+    pub fn generate_file(mappers: &[Box<dyn Mapper>]) -> String {
         let mut lines: Vec<String> = Vec::new();
         lines.append(&mut Self::disclaimer());
 
-        for mapper in &self.mappers {
+        for mapper in mappers {
             if mapper.entries().is_empty() {
                 continue;
             }

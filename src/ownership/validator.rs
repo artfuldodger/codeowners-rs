@@ -20,7 +20,6 @@ use super::mapper::{Mapper, OwnerMatcher, TeamName};
 pub struct Validator {
     pub project: Arc<Project>,
     pub mappers: Vec<Box<dyn Mapper>>,
-    pub file_generator: FileGenerator,
     pub executable_name: String,
 }
 
@@ -129,7 +128,7 @@ impl Validator {
 
     #[instrument(name = "validate_codeowners_file", level = "debug", skip_all)]
     fn validate_codeowners_file(&self) -> Vec<Error> {
-        let generated_file = self.file_generator.generate_file();
+        let generated_file = FileGenerator::generate_file(&self.mappers);
         let current_file = self.project.get_codeowners_file().unwrap_or_default();
 
         if generated_file == current_file {

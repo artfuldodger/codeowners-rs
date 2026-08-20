@@ -119,10 +119,12 @@ impl Ownership {
     #[instrument(name = "ownership_validate", level = "debug", skip_all)]
     pub fn validate(&self) -> Result<(), ValidatorErrors> {
         info!("validating file ownership");
+        // One set of mappers. This previously called `self.mappers()` twice in the
+        // same expression, building all seven mappers a second time purely for the
+        // file generator.
         let validator = Validator {
             project: self.project.clone(),
             mappers: self.mappers(),
-            file_generator: FileGenerator { mappers: self.mappers() },
             executable_name: self.project.executable_name.clone(),
         };
 
@@ -166,8 +168,7 @@ impl Ownership {
     #[instrument(level = "debug", skip_all)]
     pub fn generate_file(&self) -> String {
         info!("generating codeowners file");
-        let file_generator = FileGenerator { mappers: self.mappers() };
-        file_generator.generate_file()
+        FileGenerator::generate_file(&self.mappers())
     }
 
     #[instrument(name = "mapper_build", level = "debug", skip_all)]
