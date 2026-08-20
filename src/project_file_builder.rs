@@ -1,6 +1,8 @@
 use error_stack::Report;
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -48,31 +50,35 @@ impl<'a> ProjectFileBuilder<'a> {
     }
 }
 
-pub(crate) fn build_project_file_without_cache(path: &PathBuf) -> ProjectFile {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => {
-            return ProjectFile {
-                path: path.clone(),
-                owner: None,
-            };
-        }
-    };
+pub(crate) fn build_project_file_without_cache(path: &Path) -> ProjectFile {
+    // Only the first line can carry a `@team` annotation, so read only that line.
+    // This used to `read_to_string` the entire file: on a large repo that means
+    // reading every byte of every source file to look at one line of each.
+    let owner = first_line(path).and_then(|line| {
+        TEAM_REGEX
+            .captures(&line)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
+    });
 
-    let first_line = content.lines().next();
-    let Some(first_line) = first_line else {
-        return ProjectFile {
-            path: path.clone(),
-            owner: None,
-        };
-    };
+    ProjectFile {
+        path: path.to_path_buf(),
+        owner,
+    }
+}
 
-    let owner = TEAM_REGEX
-        .captures(first_line)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string());
-
-    ProjectFile { path: path.clone(), owner }
+/// The first line of `path`, without its line terminator.
+///
+/// Returns `None` if the file cannot be opened or its first line is not valid
+/// UTF-8, matching the previous behavior of treating an unreadable file as
+/// simply having no annotation.
+fn first_line(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line).ok()?;
+    // `str::lines()` strips a trailing \r\n as well as \n; match that.
+    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+    Some(trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -109,5 +115,57 @@ mod tests {
             let owner = TEAM_REGEX.captures(key).and_then(|cap| cap.get(1)).map(|m| m.as_str());
             assert_eq!(owner, Some(value));
         }
+    }
+
+    fn write_and_build(name: &str, bytes: &[u8]) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        build_project_file_without_cache(&path).owner
+    }
+
+    #[test]
+    fn test_reads_annotation_from_first_line() {
+        assert_eq!(
+            write_and_build("a.rb", b"# @team Payments\nclass A; end\n"),
+            Some("Payments".to_string())
+        );
+    }
+
+    #[test]
+    fn test_handles_crlf_line_endings() {
+        assert_eq!(
+            write_and_build("b.rb", b"# @team Payments\r\nclass B; end\r\n"),
+            Some("Payments".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_annotation_on_first_line() {
+        assert_eq!(write_and_build("c.rb", b"class C; end\n# @team Payments\n"), None);
+    }
+
+    #[test]
+    fn test_empty_and_unterminated_files() {
+        assert_eq!(write_and_build("d.rb", b""), None);
+        // No trailing newline at all.
+        assert_eq!(write_and_build("e.rb", b"# @team Payments"), Some("Payments".to_string()));
+    }
+
+    #[test]
+    fn test_invalid_utf8_after_a_valid_first_line() {
+        // Reading only the first line means a file whose *later* bytes are not
+        // valid UTF-8 still yields its annotation. Reading the whole file used to
+        // fail outright and report no owner. This is the one intentional behavior
+        // change from reading line-wise.
+        let mut bytes = b"# @team Payments\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00]);
+        assert_eq!(write_and_build("f.rb", &bytes), Some("Payments".to_string()));
+    }
+
+    #[test]
+    fn test_invalid_utf8_within_the_first_line() {
+        let bytes = [0xff, 0xfe, b'\n'];
+        assert_eq!(write_and_build("g.rb", &bytes), None);
     }
 }
