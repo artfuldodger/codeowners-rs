@@ -85,7 +85,7 @@ impl Args {
     fn absolute_project_root(&self) -> Result<PathBuf, Report<RunnerError>> {
         self.project_root.canonicalize().change_context(RunnerError::Io(format!(
             "Can't canonicalize project root: {}",
-            &self.project_root.to_string_lossy()
+            self.project_root.to_string_lossy()
         )))
     }
 

@@ -247,7 +247,7 @@ impl Display for Errors {
             let messages = errors.iter().flat_map(|error| error.messages()).sorted().join("\n");
             if !messages.is_empty() {
                 writeln!(f)?;
-                write!(f, "{}", &messages)?;
+                write!(f, "{}", messages)?;
             }
 
             writeln!(f)?;

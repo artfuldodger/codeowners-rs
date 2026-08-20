@@ -89,22 +89,22 @@ impl Runner {
             GlobalCache::new(run_config.project_root.clone(), config.cache_directory.clone())
                 .change_context(Error::Io(format!(
                     "Can't create cache: {}",
-                    &run_config.config_path.to_string_lossy()
+                    run_config.config_path.to_string_lossy()
                 )))
-                .attach(format!("Can't create cache: {}", &run_config.config_path.to_string_lossy()))?
+                .attach(format!("Can't create cache: {}", run_config.config_path.to_string_lossy()))?
                 .into()
         };
 
         let mut project_builder = ProjectBuilder::new(&config, run_config.project_root.clone(), codeowners_file_path.clone(), &cache);
         let project = project_builder.build().change_context(Error::Io(format!(
             "Can't build project: {}",
-            &run_config.config_path.to_string_lossy()
+            run_config.config_path.to_string_lossy()
         )))?;
         let ownership = Ownership::build(project);
 
         cache.persist_cache().change_context(Error::Io(format!(
             "Can't persist cache: {}",
-            &run_config.config_path.to_string_lossy()
+            run_config.config_path.to_string_lossy()
         )))?;
 
         Ok(Self {
@@ -250,7 +250,7 @@ impl Runner {
     pub fn delete_cache(&self) -> RunResult {
         match self.cache.delete_cache().change_context(Error::Io(format!(
             "Can't delete cache: {}",
-            &self.run_config.config_path.to_string_lossy()
+            self.run_config.config_path.to_string_lossy()
         ))) {
             Ok(_) => RunResult::default(),
             Err(err) => RunResult {
