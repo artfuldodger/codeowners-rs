@@ -2,7 +2,7 @@ use crate::project::{Project, ProjectFile};
 use core::fmt;
 use std::collections::HashSet;
 use std::fmt::Display;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -39,12 +39,13 @@ impl Validator {
     #[instrument(name = "validator_validate", level = "debug", skip_all)]
     pub fn validate(&self) -> Result<(), Errors> {
         let mut validation_errors = Vec::new();
+        let files: Vec<&ProjectFile> = self.project.files.iter().collect();
 
         debug!("validate_invalid_team");
-        validation_errors.append(&mut self.validate_invalid_team());
+        validation_errors.append(&mut self.validate_invalid_team(&files));
 
         debug!("validate_file_ownership");
-        validation_errors.append(&mut self.validate_file_ownership());
+        validation_errors.append(&mut self.validate_file_ownership(&files));
 
         debug!("validate_codeowners_file");
         validation_errors.append(&mut self.validate_codeowners_file());
@@ -56,24 +57,77 @@ impl Validator {
         }
     }
 
+    /// Validation restricted to `relative_paths`.
+    ///
+    /// Runs the same per-file checks as [`Validator::validate`] — invalid team
+    /// annotations and file ownership — over just the named files, so a caller with a
+    /// changeset pays O(changed files) rather than O(repo). Ownership is resolved
+    /// through the mappers, exactly as the whole-project run does, so a file owned two
+    /// ways is reported rather than silently resolving to whichever owner happened to
+    /// win in the generated CODEOWNERS.
+    ///
+    /// The staleness check is deliberately absent: it compares the entire generated
+    /// file against the entire on-disk one and cannot be scoped. `generate_and_validate`
+    /// makes it moot by regenerating first; a caller that needs it on its own must run
+    /// [`Validator::validate`].
+    ///
+    /// Package ownership is checked in full regardless of the path list — packages are
+    /// orders of magnitude fewer than files, and skipping them would leave a second
+    /// blind spot.
+    #[instrument(name = "validate_scoped", level = "debug", skip_all)]
+    pub fn validate_files(&self, relative_paths: &[PathBuf]) -> Result<(), Errors> {
+        let requested: HashSet<&Path> = relative_paths.iter().map(PathBuf::as_path).collect();
+
+        let files: Vec<&ProjectFile> = self
+            .project
+            .files
+            .iter()
+            .filter(|file| requested.contains(self.project.relative_path(&file.path)))
+            .collect();
+
+        let mut validation_errors = Vec::new();
+
+        // A requested path the project never walked cannot be attributed to a team.
+        // Report it as unowned, which is what a whole-project run says about any file
+        // it can't attribute.
+        let known: HashSet<&Path> = files.iter().map(|file| self.project.relative_path(&file.path)).collect();
+        validation_errors.extend(
+            relative_paths
+                .iter()
+                .filter(|path| !known.contains(path.as_path()))
+                .map(|path| Error::FileWithoutOwner { path: path.clone() }),
+        );
+
+        debug!("validate_invalid_team (scoped)");
+        validation_errors.append(&mut self.validate_invalid_team(&files));
+
+        debug!("validate_file_ownership (scoped)");
+        validation_errors.append(&mut self.validate_file_ownership(&files));
+
+        if validation_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Errors(validation_errors))
+        }
+    }
+
     #[instrument(name = "validate_invalid_team", level = "debug", skip_all)]
-    fn validate_invalid_team(&self) -> Vec<Error> {
+    fn validate_invalid_team(&self, files: &[&ProjectFile]) -> Vec<Error> {
         debug!("validating project");
         let mut errors: Vec<Error> = Vec::new();
 
         let team_names: HashSet<&TeamName> = self.project.teams.iter().map(|team| &team.name).collect();
 
-        errors.append(&mut self.invalid_team_annotation(&team_names));
+        errors.append(&mut self.invalid_team_annotation(&team_names, files));
         errors.append(&mut self.invalid_package_ownership(&team_names));
 
         errors
     }
 
-    fn invalid_team_annotation(&self, team_names: &HashSet<&String>) -> Vec<Error> {
+    fn invalid_team_annotation(&self, team_names: &HashSet<&String>, files: &[&ProjectFile]) -> Vec<Error> {
         let project = self.project.clone();
 
-        self.project
-            .files
+        files
             .par_iter()
             .flat_map(|file| {
                 if let Some(owner) = &file.owner
@@ -108,10 +162,10 @@ impl Validator {
     }
 
     #[instrument(name = "validate_file_ownership", level = "debug", skip_all)]
-    fn validate_file_ownership(&self) -> Vec<Error> {
+    fn validate_file_ownership(&self, files: &[&ProjectFile]) -> Vec<Error> {
         let mut validation_errors = Vec::new();
 
-        for (file, owners) in self.file_to_owners() {
+        for (file, owners) in self.file_to_owners(files) {
             let relative_path = self.project.relative_path(&file.path).to_owned();
 
             if owners.is_empty() {
@@ -143,20 +197,19 @@ impl Validator {
     }
 
     #[instrument(name = "file_to_owners", level = "debug", skip_all)]
-    fn file_to_owners(&self) -> Vec<(&ProjectFile, Vec<Owner>)> {
+    fn file_to_owners<'a>(&'a self, files: &[&'a ProjectFile]) -> Vec<(&'a ProjectFile, Vec<Owner>)> {
         let owner_matchers: Vec<OwnerMatcher> = self.mappers.iter().flat_map(|mapper| mapper.owner_matchers()).collect();
         let file_owner_finder = FileOwnerFinder {
             owner_matchers: &owner_matchers,
         };
         let project = self.project.clone();
 
-        self.project
-            .files
+        files
             .par_iter()
-            .filter_map(|project_file| {
+            .map(|project_file| {
                 let relative_path = project.relative_path(&project_file.path);
                 let owners = file_owner_finder.find(relative_path);
-                Some((project_file, owners))
+                (*project_file, owners)
             })
             .collect()
     }

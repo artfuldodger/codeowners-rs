@@ -4,7 +4,7 @@ use mapper::{OwnerMatcher, Source, TeamName};
 use std::{
     error::Error,
     fmt::{self, Display},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tracing::{info, instrument};
@@ -127,6 +127,22 @@ impl Ownership {
         };
 
         validator.validate()
+    }
+
+    /// Like [`Ownership::validate`], but restricted to the supplied project-relative
+    /// paths. Skips the staleness check, which cannot be scoped — see
+    /// [`Validator::validate_files`].
+    #[instrument(name = "ownership_validate_files", level = "debug", skip_all)]
+    pub fn validate_files(&self, relative_paths: &[PathBuf]) -> Result<(), ValidatorErrors> {
+        info!("validating file ownership for {} supplied paths", relative_paths.len());
+        let validator = Validator {
+            project: self.project.clone(),
+            mappers: self.mappers(),
+            file_generator: FileGenerator { mappers: self.mappers() },
+            executable_name: self.project.executable_name.clone(),
+        };
+
+        validator.validate_files(relative_paths)
     }
 
     #[instrument(level = "debug", skip_all)]

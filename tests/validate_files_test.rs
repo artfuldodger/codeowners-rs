@@ -36,7 +36,9 @@ fn test_validate_with_unowned_file() -> Result<(), Box<dyn Error>> {
         &["validate", "ruby/app/unowned.rb"],
         false,
         OutputStream::Stdout,
-        predicate::str::contains("ruby/app/unowned.rb"),
+        // Same wording a whole-project `validate` uses for an unattributable file --
+        // supplying paths no longer produces a separate "Unowned files detected:" format.
+        predicate::str::contains("ruby/app/unowned.rb").and(predicate::str::contains("missing ownership")),
     )?;
 
     Ok(())
@@ -51,7 +53,9 @@ fn test_validate_with_mixed_files() -> Result<(), Box<dyn Error>> {
         &["validate", "ruby/app/models/payroll.rb", "ruby/app/unowned.rb"],
         false,
         OutputStream::Stdout,
-        predicate::str::contains("ruby/app/unowned.rb"),
+        // Same wording a whole-project `validate` uses for an unattributable file --
+        // supplying paths no longer produces a separate "Unowned files detected:" format.
+        predicate::str::contains("ruby/app/unowned.rb").and(predicate::str::contains("missing ownership")),
     )?;
 
     Ok(())
@@ -110,7 +114,8 @@ fn test_generate_and_validate_with_unowned_file() -> Result<(), Box<dyn Error>> 
         .arg("ruby/app/unowned.rb")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("ruby/app/unowned.rb"));
+        .stdout(predicate::str::contains("ruby/app/unowned.rb"))
+        .stdout(predicate::str::contains("missing ownership"));
 
     Ok(())
 }
@@ -137,14 +142,14 @@ fn test_validate_with_absolute_path() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn test_validate_only_checks_codeowners_file() -> Result<(), Box<dyn Error>> {
-    // This test demonstrates that `validate` with files only checks the CODEOWNERS file
-    // It does NOT check file annotations or other ownership sources
+fn test_validate_with_paths_resolves_ownership_through_mappers() -> Result<(), Box<dyn Error>> {
+    // Ownership for a supplied path is resolved through the mappers, not by reading the
+    // generated CODEOWNERS back. This test used to assert the opposite -- that `validate`
+    // with files consulted only the CODEOWNERS file and ignored annotations -- which is
+    // exactly the weakness that let a dual-owned file pass.
     //
-    // If a file has an annotation but is missing from CODEOWNERS, `validate` will report it as unowned
-    // This is why `generate-and-validate` should be used for accuracy
-
-    // ruby/app/models/bank_account.rb has @team Payments annotation and is in CODEOWNERS
+    // ruby/app/models/bank_account.rb has a @team Payments annotation and is in CODEOWNERS,
+    // so it is owned exactly once and validates cleanly either way.
     run_codeowners(
         "valid_project",
         &["validate", "ruby/app/models/bank_account.rb"],

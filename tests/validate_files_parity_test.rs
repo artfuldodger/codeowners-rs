@@ -1,23 +1,25 @@
 //! Parity between `validate` / `gv` with an explicit file list and the same command with
 //! no file list.
 //!
-//! Passing paths swaps `validate_all()` for `validate_files()` (`runner.rs:124`).
-//! `validate_all` runs three checks -- `validate_invalid_team`, `validate_file_ownership`,
-//! `validate_codeowners_file` (`validator.rs:40-57`). `validate_files` runs none of them;
-//! it only asks whether each path resolves to a team when reading the CODEOWNERS file.
+//! Passing paths routes through `validate_files()` instead of `validate_all()`
+//! (`runner.rs:124`). Both resolve ownership through the mappers, so both catch an
+//! invalid team annotation and a file owned two ways; `validate_files` simply scopes the
+//! per-file checks to the supplied paths.
 //!
-//! `gv <paths>` regenerates before validating, which cures staleness by construction, but
-//! not the other two. Worse, regenerating makes a dual-owned file *appear* owned, so the
-//! per-path check waves it through.
+//! Only the staleness check differs, and unavoidably so: it compares the whole generated
+//! CODEOWNERS against the whole on-disk one, so it cannot be scoped to a subset.
+//! `gv <paths>` makes it moot by regenerating first.
 //!
-//! EVERY TEST IN THIS FILE CURRENTLY FAILS, so all are `#[ignore]`d to keep the suite green.
-//! They assert the behavior we want and exist to document the gap. Run them with:
+//! These previously all failed. `validate_files` used to answer only "does this path have
+//! an owner in the CODEOWNERS file", which could not see a file owned two ways — generation
+//! picks one winner, so the file looked owned and the command exited 0. They are kept as
+//! regression guards against reintroducing that shortcut.
+//!
+//! One test remains `#[ignore]`d for a separate, still-unfixed bug. Run it with:
 //!
 //! ```sh
 //! cargo test --test validate_files_parity_test -- --ignored
 //! ```
-//!
-//! Remove the `#[ignore]` attributes as each is fixed.
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
@@ -32,15 +34,14 @@ use common::*;
 const FIXTURE: &str = "tests/fixtures/invalid_project";
 
 #[test]
-#[ignore = "documents the validate/gv <paths> parity gap; remove when fixed"]
 fn test_gv_with_paths_detects_dual_ownership_via_codeowner_file() -> Result<(), Box<dyn Error>> {
     // `ruby/app/services/multi_owned.rb` is owned twice: a `@team Payments` annotation and
     // `ruby/app/services/.codeowner` naming Payroll. Full `gv` reports "Code ownership
     // should only be defined for each file in one way".
     //
-    // BUG: `gv` regenerates first, which writes the file into CODEOWNERS as @PaymentTeam.
-    // The per-path check then finds an owner and exits 0. A false pass -- the commit is
-    // waved through with genuinely ambiguous ownership.
+    // Regression guard. This used to exit 0 with empty output: `gv` regenerates first,
+    // writing the file into CODEOWNERS under @PaymentTeam, so a check that read CODEOWNERS
+    // back found an owner and passed. Regeneration concealed the defect.
     let temp_dir = setup_fixture_repo(std::path::Path::new(FIXTURE));
     let project_root = temp_dir.path();
     git_add_all_files(project_root);
@@ -59,13 +60,12 @@ fn test_gv_with_paths_detects_dual_ownership_via_codeowner_file() -> Result<(), 
 }
 
 #[test]
-#[ignore = "documents the validate/gv <paths> parity gap; remove when fixed"]
 fn test_gv_with_paths_detects_dual_ownership_via_owned_gems() -> Result<(), Box<dyn Error>> {
     // Same class, different source: `gems/payroll_calculator/calculator.rb` has a
     // `@team Payments` annotation while Payroll claims it through `owned_gems`.
     //
-    // BUG: same false pass. Included separately because the two travel through different
-    // mappers, so a fix could plausibly catch one and miss the other.
+    // Regression guard, same false pass. Kept separate because the two travel through
+    // different mappers, so a regression could reappear in one and not the other.
     let temp_dir = setup_fixture_repo(std::path::Path::new(FIXTURE));
     let project_root = temp_dir.path();
     git_add_all_files(project_root);
@@ -84,15 +84,13 @@ fn test_gv_with_paths_detects_dual_ownership_via_owned_gems() -> Result<(), Box<
 }
 
 #[test]
-#[ignore = "documents the validate/gv <paths> parity gap; remove when fixed"]
 fn test_gv_with_paths_names_the_invalid_team() -> Result<(), Box<dyn Error>> {
     // `ruby/app/models/blockchain.rb` is annotated `@team Web3`, which is not a team. Full
     // `gv` reports "is referencing an invalid team - 'Web3'".
     //
-    // BUG: this one does fail, but for the wrong reason. An invalid team yields no owner, so
-    // the file is absent from the generated CODEOWNERS and gets reported as merely "unowned".
-    // The actual fault -- a typo'd team name -- is never named, so the developer goes looking
-    // for missing ownership instead of fixing the annotation.
+    // Regression guard. This used to fail, but for the wrong reason: an invalid team yields
+    // no owner, so the file was absent from the generated CODEOWNERS and reported as merely
+    // "unowned", sending the developer after missing ownership instead of a typo'd team.
     let temp_dir = setup_fixture_repo(std::path::Path::new(FIXTURE));
     let project_root = temp_dir.path();
     git_add_all_files(project_root);
@@ -111,14 +109,14 @@ fn test_gv_with_paths_names_the_invalid_team() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-#[ignore = "documents the validate/gv <paths> parity gap; remove when fixed"]
 fn test_gv_with_every_path_matches_gv_with_no_paths() -> Result<(), Box<dyn Error>> {
     // The differential check: handing over every owned file should be equivalent to handing
     // over none. This is the general form of the three tests above -- it needs no knowledge
     // of which defects the fixture contains, so it keeps working as fixtures change.
     //
-    // BUG: the no-paths run reports dual ownership and the invalid team; the all-paths run
-    // reports neither.
+    // Regression guard, and the most valuable of the set: it needs no knowledge of the
+    // fixture's contents, so it keeps working as fixtures change. The all-paths run used to
+    // report neither the dual ownership nor the invalid team.
     let temp_dir = setup_fixture_repo(std::path::Path::new(FIXTURE));
     let project_root = temp_dir.path();
     git_add_all_files(project_root);
@@ -147,8 +145,9 @@ fn test_gv_with_every_path_matches_gv_with_no_paths() -> Result<(), Box<dyn Erro
         .args(&owned_files)
         .output()?;
 
-    // Compare the defects each run found, not byte-for-byte output: the two use different
-    // report formats, and only the substance is being claimed here.
+    // Compare the defects each run found rather than byte-for-byte output. The two now
+    // share a report format, but the no-paths run legitimately reports more (staleness,
+    // and files outside the supplied list), so only the shared substance is claimed here.
     let no_paths_out = String::from_utf8_lossy(&no_paths.stdout);
     let all_paths_out = String::from_utf8_lossy(&all_paths.stdout);
 
@@ -170,7 +169,7 @@ fn test_gv_with_every_path_matches_gv_with_no_paths() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-#[ignore = "documents the validate/gv <paths> parity gap; remove when fixed"]
+#[ignore = "separate pre-existing bug: owned_globs filter drops non-canonical absolute paths"]
 fn test_validate_does_not_silently_skip_absolute_paths() -> Result<(), Box<dyn Error>> {
     // Unrelated to the parity gap above, and the most dangerous of the set because it is
     // completely silent.
