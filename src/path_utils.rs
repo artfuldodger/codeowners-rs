@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Return `path` relative to `root` if possible; otherwise return `path` unchanged.
 pub fn relative_to<'a>(root: &'a Path, path: &'a Path) -> &'a Path {
@@ -8,6 +8,58 @@ pub fn relative_to<'a>(root: &'a Path, path: &'a Path) -> &'a Path {
 /// Like `relative_to`, but returns an owned `PathBuf`.
 pub fn relative_to_buf(root: &Path, path: &Path) -> PathBuf {
     relative_to(root, path).to_path_buf()
+}
+
+/// Reduce a caller-supplied `path` to the project-relative form that
+/// [`crate::project::Project::relative_path`] produces for walked files.
+///
+/// Unlike [`relative_to`], which passes an unstrippable path through unchanged, this
+/// reports failure. A path that cannot be placed inside the project is not a path the
+/// per-file checks can say anything about, and silently treating it as relative is how
+/// `/var/...` came to be compared against project-relative paths and matched nothing.
+///
+/// Purely lexical — no filesystem access, so it is safe on a path that no longer exists
+/// (a deleted file in a changeset). `.` components are dropped and `..` pops the
+/// preceding component, so `./a/b.rb` and `a/c/../b.rb` both reduce to `a/b.rb`.
+///
+/// Returns `None` when `path` is absolute and does not lie under `root`, when it escapes
+/// `root` via `..`, or when it *is* `root`. The absolute case is not necessarily final:
+/// `cli.rs` canonicalizes `--project-root`, so on macOS a root of `/private/var/...` will
+/// not strip a caller-supplied `/var/...`. A caller that gets `None` for an absolute path
+/// should retry with a canonicalized copy.
+pub fn project_relative(root: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = if path.is_absolute() { path.strip_prefix(root).ok()? } else { path };
+
+    let normalized = lexically_normalize(relative);
+    if normalized.as_os_str().is_empty() || normalized.starts_with("..") {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+/// Resolve `.` and `..` without touching the filesystem.
+///
+/// Deliberately lexical: canonicalizing would also resolve symlinks, and the project walk
+/// records the symlink path rather than its target, so resolving here would produce a path
+/// that matches no walked file.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // A `..` that cannot pop is retained, so the caller can detect the escape.
+                if !normalized.pop() {
+                    normalized.push(Component::ParentDir);
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+
+    normalized
 }
 
 #[cfg(test)]
@@ -45,5 +97,47 @@ mod tests {
         let rel_ref = relative_to(root, path);
         let rel_buf = relative_to_buf(root, path);
         assert_eq!(rel_ref, rel_buf.as_path());
+    }
+
+    #[test]
+    fn project_relative_passes_through_a_plain_relative_path() {
+        let rel = project_relative(Path::new("/proj"), Path::new("ruby/app/a.rb"));
+        assert_eq!(rel, Some(PathBuf::from("ruby/app/a.rb")));
+    }
+
+    #[test]
+    fn project_relative_strips_a_leading_dot_slash() {
+        // `./a.rb` and `a.rb` name the same file, but only one of them used to match a
+        // walked project file -- the other was silently dropped by the owned_globs filter.
+        let rel = project_relative(Path::new("/proj"), Path::new("./ruby/app/a.rb"));
+        assert_eq!(rel, Some(PathBuf::from("ruby/app/a.rb")));
+    }
+
+    #[test]
+    fn project_relative_resolves_interior_parent_dirs() {
+        let rel = project_relative(Path::new("/proj"), Path::new("ruby/services/../app/a.rb"));
+        assert_eq!(rel, Some(PathBuf::from("ruby/app/a.rb")));
+    }
+
+    #[test]
+    fn project_relative_strips_the_root_from_an_absolute_path() {
+        let rel = project_relative(Path::new("/proj"), Path::new("/proj/ruby/app/a.rb"));
+        assert_eq!(rel, Some(PathBuf::from("ruby/app/a.rb")));
+    }
+
+    #[test]
+    fn project_relative_rejects_an_absolute_path_outside_the_root() {
+        // The caller retries with a canonicalized copy; see `Runner::project_relative_path`.
+        assert_eq!(project_relative(Path::new("/private/proj"), Path::new("/proj/a.rb")), None);
+    }
+
+    #[test]
+    fn project_relative_rejects_a_path_escaping_the_root() {
+        assert_eq!(project_relative(Path::new("/proj"), Path::new("../outside/a.rb")), None);
+    }
+
+    #[test]
+    fn project_relative_rejects_the_root_itself() {
+        assert_eq!(project_relative(Path::new("/proj"), Path::new("/proj")), None);
     }
 }
