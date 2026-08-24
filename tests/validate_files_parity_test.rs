@@ -6,20 +6,21 @@
 //! invalid team annotation and a file owned two ways; `validate_files` simply scopes the
 //! per-file checks to the supplied paths.
 //!
-//! Only the staleness check differs, and unavoidably so: it compares the whole generated
-//! CODEOWNERS against the whole on-disk one, so it cannot be scoped to a subset.
-//! `gv <paths>` makes it moot by regenerating first.
+//! Two things differ, both deliberately. The staleness check is unavoidable: it compares
+//! the whole generated CODEOWNERS against the whole on-disk one, so it cannot be scoped to
+//! a subset, and `gv <paths>` makes it moot by regenerating first. The package check is
+//! scoped to packages containing a supplied path, so that one bad package owner elsewhere
+//! in the repo does not fail every scoped run; the `*_invalid_package*` tests pin both
+//! halves of that, and the `*_untracked_*` pair pins that a path the walk never recorded is
+//! asked about rather than assumed unowned.
 //!
-//! These previously all failed. `validate_files` used to answer only "does this path have
-//! an owner in the CODEOWNERS file", which could not see a file owned two ways — generation
-//! picks one winner, so the file looked owned and the command exited 0. They are kept as
-//! regression guards against reintroducing that shortcut.
+//! The `gv_*` tests previously all failed. `validate_files` used to answer only "does this
+//! path have an owner in the CODEOWNERS file", which could not see a file owned two ways —
+//! generation picks one winner, so the file looked owned and the command exited 0. They are
+//! kept as regression guards against reintroducing that shortcut.
 //!
-//! One test remains `#[ignore]`d for a separate, still-unfixed bug. Run it with:
-//!
-//! ```sh
-//! cargo test --test validate_files_parity_test -- --ignored
-//! ```
+//! Normalization of the supplied paths themselves is covered separately, in
+//! `supplied_path_normalization_test.rs`.
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
@@ -168,37 +169,163 @@ fn test_gv_with_every_path_matches_gv_with_no_paths() -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+/// Rewrite the fixture's one package manifest to name a team that does not exist, and
+/// return the repo. Used by the package-scoping tests below.
+fn fixture_with_an_invalid_package_owner() -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp_dir = setup_fixture_repo(std::path::Path::new(FIXTURE));
+    let project_root = temp_dir.path().to_path_buf();
+
+    let manifest = project_root.join("ruby/packages/payroll_flow/package.yml");
+    assert!(manifest.exists(), "fixture should contain a package manifest");
+    std::fs::write(&manifest, "owner: NoSuchTeam\n").expect("failed to write package manifest");
+
+    // A file inside that package, so the in-scope case has something to name.
+    let inside = project_root.join("ruby/packages/payroll_flow/app/thing.rb");
+    std::fs::create_dir_all(inside.parent().unwrap()).expect("failed to create package dir");
+    std::fs::write(&inside, "# inside the badly-owned package\n").expect("failed to write file");
+
+    git_add_all_files(&project_root);
+    (temp_dir, project_root)
+}
+
 #[test]
-#[ignore = "separate pre-existing bug: owned_globs filter drops non-canonical absolute paths"]
-fn test_validate_does_not_silently_skip_absolute_paths() -> Result<(), Box<dyn Error>> {
-    // Unrelated to the parity gap above, and the most dangerous of the set because it is
-    // completely silent.
+fn test_validate_with_paths_ignores_an_unrelated_invalid_package() -> Result<(), Box<dyn Error>> {
+    // The package check is scoped to packages containing a supplied path. Checking every
+    // package meant validating one file could fail over a package that file had nothing to
+    // do with -- and since the gem's `--diff` mode feeds a changeset in, one pre-existing
+    // bad package owner would block every commit in the repo until someone fixed it.
+    let (_temp_dir, project_root) = fixture_with_an_invalid_package_owner();
+
+    Command::cargo_bin("codeowners")?
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--no-cache")
+        .arg("validate")
+        .arg("ruby/app/models/bank_account.rb")
+        .assert()
+        .success()
+        .stdout(predicate::eq(""));
+
+    Ok(())
+}
+
+#[test]
+fn test_validate_with_paths_reports_an_invalid_package_containing_a_supplied_path() -> Result<(), Box<dyn Error>> {
+    // The other half of the scoping: in scope means reported. Without this, scoping the
+    // package check would just be a blind spot.
+    let (_temp_dir, project_root) = fixture_with_an_invalid_package_owner();
+
+    Command::cargo_bin("codeowners")?
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--no-cache")
+        .arg("validate")
+        .arg("ruby/packages/payroll_flow/app/thing.rb")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("package.yml").and(predicate::str::contains("NoSuchTeam")));
+
+    Ok(())
+}
+
+#[test]
+fn test_validate_with_paths_reports_a_supplied_package_manifest() -> Result<(), Box<dyn Error>> {
+    // Supplying the manifest itself has to work, or the scoped check would never catch a
+    // bad package owner at the moment it is introduced -- only later, via some unrelated
+    // commit that happened to touch a file inside that package. The manifest does not match
+    // `owned_globs`, so it is not eligible to be reported as unowned; it is in scope purely
+    // as a package selector.
+    let (_temp_dir, project_root) = fixture_with_an_invalid_package_owner();
+
+    Command::cargo_bin("codeowners")?
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--no-cache")
+        .arg("validate")
+        .arg("ruby/packages/payroll_flow/package.yml")
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("package.yml")
+                .and(predicate::str::contains("NoSuchTeam"))
+                .and(predicate::str::contains("missing ownership").not()),
+        );
+
+    Ok(())
+}
+
+#[test]
+fn test_validate_with_no_paths_still_reports_every_invalid_package() -> Result<(), Box<dyn Error>> {
+    // Scoping applies only to the scoped run. The whole-project run must keep reporting
+    // every bad package, including the one the tests above deliberately do not name.
+    let (_temp_dir, project_root) = fixture_with_an_invalid_package_owner();
+
+    Command::cargo_bin("codeowners")?
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--no-cache")
+        .arg("validate")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("package.yml").and(predicate::str::contains("NoSuchTeam")));
+
+    Ok(())
+}
+
+#[test]
+fn test_validate_attributes_an_untracked_file_through_the_mappers() -> Result<(), Box<dyn Error>> {
+    // A brand-new file, not yet staged, in a directory carrying a `.codeowner`. It is
+    // absent from `project.files` (the walk only records git-tracked files), but it is
+    // genuinely owned -- `.codeowner` owns the directory, so the file is owned the moment
+    // it exists.
     //
-    // `cli.rs` canonicalizes `--project-root`. On macOS the temp dir is under `/var`, which
-    // canonicalizes to `/private/var`, so a caller-supplied `/var/...` path fails
-    // `strip_prefix`, stays absolute, and is then rejected by the `owned_globs` filter --
-    // dropped before any ownership query runs. Exit 0, no output, file never checked.
-    //
-    // valid_project is used here because its owned_globs are directory-anchored
-    // (`{gems,config,javascript,ruby,components}/**`). With a `**`-leading glob the same path
-    // survives the filter and is reported spuriously unowned instead, so the symptom is
-    // config-dependent while the cause is the same.
-    let temp_dir = setup_fixture_repo(std::path::Path::new("tests/fixtures/valid_project"));
+    // This used to report "Some files are missing ownership": paths the walk had not
+    // recorded were assumed unowned rather than asked about. That put two commands in the
+    // same binary at odds on the same path, since `for-file` resolves through the mappers
+    // and correctly answered Payroll. It also failed in the annoying direction -- a
+    // pre-commit hook rejecting a file for lacking an owner it does have.
+    let temp_dir = setup_fixture_repo(std::path::Path::new(FIXTURE));
     let project_root = temp_dir.path();
     git_add_all_files(project_root);
 
-    // Deliberately NOT canonicalized -- that is the bug.
-    let absolute = project_root.join("ruby/app/unowned.rb");
+    // `ruby/app/services/.codeowner` names Payroll. Written after `git add`, so untracked.
+    let untracked = project_root.join("ruby/app/services/brand_new.rb");
+    std::fs::write(&untracked, "# no annotation; owned by the directory\n")?;
 
     Command::cargo_bin("codeowners")?
         .arg("--project-root")
         .arg(project_root)
         .arg("--no-cache")
         .arg("validate")
-        .arg(absolute.to_str().unwrap())
+        .arg("ruby/app/services/brand_new.rb")
+        .assert()
+        .success()
+        .stdout(predicate::eq(""));
+
+    Ok(())
+}
+
+#[test]
+fn test_validate_still_reports_an_untracked_file_with_no_owner() -> Result<(), Box<dyn Error>> {
+    // The other side of the test above: resolving unwalked paths through the mappers must
+    // not turn into "unwalked paths always pass". `ruby/app/` has no `.codeowner`, so a new
+    // file there is genuinely unowned and must still be reported.
+    let temp_dir = setup_fixture_repo(std::path::Path::new(FIXTURE));
+    let project_root = temp_dir.path();
+    git_add_all_files(project_root);
+
+    let untracked = project_root.join("ruby/app/orphan_new.rb");
+    std::fs::write(&untracked, "# nobody owns this\n")?;
+
+    Command::cargo_bin("codeowners")?
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--no-cache")
+        .arg("validate")
+        .arg("ruby/app/orphan_new.rb")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("unowned.rb"));
+        .stdout(predicate::str::contains("orphan_new.rb").and(predicate::str::contains("missing ownership")));
 
     Ok(())
 }
