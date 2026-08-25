@@ -153,14 +153,14 @@ impl Runner {
         // exited 0 having checked nothing -- a false pass in the unsafe direction.
         //
         // The canonical root is resolved once rather than per path, since only the retry
-        // inside `project_relative_path` needs it and that retry can fire for every path
+        // inside `resolve_project_relative` needs it and that retry can fire for every path
         // when a caller passes an absolute list.
         let canonical_root = self.run_config.project_root.canonicalize().ok();
 
         let relative_paths: Vec<PathBuf> = file_paths
             .iter()
             .filter_map(|file_path| {
-                Self::project_relative_path(&self.run_config.project_root, canonical_root.as_deref(), Path::new(file_path))
+                crate::path_utils::resolve_project_relative(&self.run_config.project_root, canonical_root.as_deref(), Path::new(file_path))
             })
             // A path that no longer exists is dropped rather than reported. Changesets
             // delete files routinely and `git diff --name-only` lists them, so reporting a
@@ -213,28 +213,6 @@ impl Runner {
         }
 
         RunResult::default()
-    }
-
-    /// Reduce a caller-supplied path to project-relative form.
-    ///
-    /// An absolute path only strips if it and the root agree about symlinks, and there is
-    /// no guarantee they do — `cli.rs` canonicalizes `--project-root`, but a library caller
-    /// building its own `RunConfig` (which is how the `code_ownership` gem calls in) does
-    /// not. So on macOS, where `TMPDIR` lives under `/var`, a symlink to `/private/var`,
-    /// *either* side can be the unresolved one, and in a symlinked checkout the same is
-    /// true generally.
-    ///
-    /// Hence the retry resolves both sides rather than just the path: fixing only the path
-    /// leaves the mirror-image case — a canonical path against an unresolved root — failing
-    /// exactly as silently. The first attempt uses the root as given, so the common case of
-    /// relative paths costs no syscalls at all.
-    fn project_relative_path(root: &Path, canonical_root: Option<&Path>, path: &Path) -> Option<PathBuf> {
-        if let Some(relative) = crate::path_utils::project_relative(root, path) {
-            return Some(relative);
-        }
-
-        let canonical_path = path.canonicalize().ok()?;
-        crate::path_utils::project_relative(canonical_root.unwrap_or(root), &canonical_path)
     }
 
     pub fn generate(&self, git_stage: bool) -> RunResult {

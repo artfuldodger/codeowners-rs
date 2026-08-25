@@ -38,6 +38,35 @@ pub fn project_relative(root: &Path, path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+/// Like [`project_relative`], but consults the filesystem when the lexical attempt fails.
+///
+/// An absolute path only strips if it and `root` agree about symlinks, and there is no
+/// guarantee they do. `cli.rs` canonicalizes `--project-root`, but a library caller building
+/// its own `RunConfig` (which is how the `code_ownership` gem calls in) does not. So on
+/// macOS, where `TMPDIR` lives under `/var`, a symlink to `/private/var`, *either* side can
+/// be the unresolved one, and in a symlinked checkout the same is true generally. Resolving
+/// only one side leaves the other failing exactly as silently, so the retry resolves both.
+///
+/// It resolves the **parent** and re-attaches the file name, rather than canonicalizing the
+/// whole path. Canonicalizing the leaf would follow a symlinked *file*, and the project walk
+/// records the symlink path rather than its target — so an absolute path naming a symlink
+/// would be checked as a different file than the caller asked about, and pass or fail on
+/// that file's ownership instead. A symlinked *ancestor* is still resolved, unavoidably:
+/// that is the whole point in the `/var` case, and the walk does not follow symlinked
+/// directories anyway, so such a path names no walked file under either spelling.
+///
+/// `canonical_root` is the resolved `root`, passed in rather than computed so a caller
+/// normalizing a whole changeset pays for it once instead of once per path.
+pub fn resolve_project_relative(root: &Path, canonical_root: Option<&Path>, path: &Path) -> Option<PathBuf> {
+    if let Some(relative) = project_relative(root, path) {
+        return Some(relative);
+    }
+
+    let resolved = path.parent()?.canonicalize().ok()?.join(path.file_name()?);
+
+    project_relative(canonical_root.unwrap_or(root), &resolved)
+}
+
 /// Resolve `.` and `..` without touching the filesystem.
 ///
 /// Deliberately lexical: canonicalizing would also resolve symlinks, and the project walk
@@ -127,7 +156,7 @@ mod tests {
 
     #[test]
     fn project_relative_rejects_an_absolute_path_outside_the_root() {
-        // The caller retries with a canonicalized copy; see `Runner::project_relative_path`.
+        // The caller retries with the parent resolved; see `resolve_project_relative`.
         assert_eq!(project_relative(Path::new("/private/proj"), Path::new("/proj/a.rb")), None);
     }
 

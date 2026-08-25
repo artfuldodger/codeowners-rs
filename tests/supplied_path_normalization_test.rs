@@ -18,7 +18,10 @@
 //! that, a test cannot tell "checked correctly" from "mishandled and spuriously reported",
 //! which is exactly how an earlier draft of this file passed against unfixed code.
 //!
-//! One test covers the `**`-glob direction, since the symptom there is the opposite.
+//! One test covers the `**`-glob direction, since the symptom there is the opposite. Two
+//! more assert an *owned* file still passes under each odd spelling — without those, every
+//! assertion here would also hold if normalization mangled one path into some other unowned
+//! path.
 //!
 //! Path forms covered, against both states the project root can be in (resolved or not,
 //! since `cli.rs` canonicalizes it but a library caller need not):
@@ -27,6 +30,7 @@
 //! - absolute, root and path agreeing about symlinks
 //! - absolute, root resolved and path not
 //! - absolute, path resolved and root not (library callers only)
+//! - absolute, naming a symlinked *file* -- must check the symlink, not its target
 //! - a deleted path, and a path outside the project -- both skipped, deliberately
 
 use assert_cmd::prelude::*;
@@ -53,6 +57,27 @@ fn fixture_with_an_unowned_file() -> TempDir {
     std::fs::write(temp_dir.path().join(NORMALIZED), "# nobody owns this\n").expect("failed to write unowned file");
     git_add_all_files(temp_dir.path());
     temp_dir
+}
+
+/// Assert `validate <spelling>` succeeds, i.e. the path reached the check *and* resolved to
+/// a file that really is owned.
+///
+/// The counterpart to `assert_normalizes`: those tests would still pass if normalization
+/// mangled a path into some *other* unowned path, and these would not.
+fn assert_owned_file_passes(spelling: &str) -> Result<(), Box<dyn Error>> {
+    let temp_dir = fixture_with_an_unowned_file();
+
+    Command::cargo_bin("codeowners")?
+        .arg("--project-root")
+        .arg(temp_dir.path())
+        .arg("--no-cache")
+        .arg("validate")
+        .arg(spelling)
+        .assert()
+        .success()
+        .stdout(predicate::eq(""));
+
+    Ok(())
 }
 
 /// Assert `validate <spelling>` reached the ownership check and reported the file under its
@@ -156,6 +181,64 @@ fn test_absolute_path_when_only_the_path_is_resolved() {
         project_root.display(),
         canonical_file.display(),
         result.validation_errors,
+    );
+}
+
+#[test]
+fn test_owned_file_passes_with_a_dot_slash_prefix() -> Result<(), Box<dyn Error>> {
+    // A positive guard. Every assertion above is that an *unowned* file gets reported, which
+    // would also hold if normalization mangled the path into some other unowned path. This
+    // pins that a well-owned file still resolves to itself and passes.
+    assert_owned_file_passes("./ruby/app/models/payroll.rb")
+}
+
+#[test]
+fn test_owned_file_passes_with_an_interior_parent_dir() -> Result<(), Box<dyn Error>> {
+    assert_owned_file_passes("ruby/app/payments/../models/payroll.rb")
+}
+
+#[test]
+fn test_absolute_path_to_a_symlink_names_the_symlink_not_its_target() {
+    // Regression guard. The retry used to canonicalize the whole supplied path, which
+    // follows a symlinked *file*, so an absolute path naming a symlink was checked as its
+    // target -- a different file than the caller asked about. The retry now resolves only
+    // the parent and re-attaches the file name, fixing the ancestor `/var` ->
+    // `/private/var` discrepancy without following the leaf.
+    //
+    // Both the symlink and its target are unowned here, and the assertion is on *which path
+    // the report names* rather than on pass/fail. An earlier version pointed the symlink at
+    // an owned file and asserted failure, which was fixture-coupled and wrong: reading
+    // through a symlink sees the target's contents, so once ownership is resolved through
+    // the mappers rather than by reading CODEOWNERS back, the symlink genuinely inherits the
+    // target's `@team` annotation and is owned. Naming the path sidesteps that entirely.
+    //
+    // The symlink is created after `setup_fixture_repo` because that helper copies with
+    // `fs::copy`, which would follow it and write a regular file instead.
+    let temp_dir = fixture_with_an_unowned_file();
+    let project_root = temp_dir.path();
+
+    let link = project_root.join("ruby/app/link_to_unowned.rb");
+    std::os::unix::fs::symlink("unowned.rb", &link).expect("failed to create symlink");
+    git_add_all_files(project_root);
+
+    // Deliberately NOT canonicalized, so the retry fires.
+    let absolute = link.to_string_lossy().to_string();
+
+    let output = Command::cargo_bin("codeowners")
+        .expect("binary")
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--no-cache")
+        .arg("validate")
+        .arg(&absolute)
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("link_to_unowned.rb"),
+        "the report names the symlink's target instead of the symlink the caller asked \
+         about, so the retry followed the leaf.\nstdout={stdout}"
     );
 }
 
