@@ -197,6 +197,10 @@ fn test_owned_file_passes_with_an_interior_parent_dir() -> Result<(), Box<dyn Er
     assert_owned_file_passes("ruby/app/payments/../models/payroll.rb")
 }
 
+// `std::os::unix::fs::symlink` has no portable equivalent, and this crate ships only
+// macOS and Linux artifacts (see .github/workflows/ci.yml), so the test is gated rather
+// than made portable -- `cargo test` still compiles everywhere.
+#[cfg(unix)]
 #[test]
 fn test_absolute_path_to_a_symlink_names_the_symlink_not_its_target() {
     // Regression guard. The retry used to canonicalize the whole supplied path, which
@@ -309,7 +313,9 @@ fn test_deleted_path_is_skipped() -> Result<(), Box<dyn Error>> {
 #[test]
 fn test_path_outside_the_project_is_skipped_not_panicked_on() -> Result<(), Box<dyn Error>> {
     // A `..` that escapes the root cannot name a project file, so it is dropped rather than
-    // treated as relative. Pinned mainly so it stays a skip and not a panic.
+    // treated as relative. Pinned mainly so it stays a skip and not a panic -- and, since the
+    // filesystem retry is now gated to absolute paths, so that it stays a skip regardless of
+    // the process CWD.
     let temp_dir = fixture_with_an_unowned_file();
 
     Command::cargo_bin("codeowners")?

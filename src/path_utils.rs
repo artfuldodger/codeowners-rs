@@ -62,6 +62,16 @@ pub fn resolve_project_relative(root: &Path, canonical_root: Option<&Path>, path
         return Some(relative);
     }
 
+    // Only an absolute path can be rescued. A relative path is interpreted against the
+    // project root by contract -- that is what `--help` promises -- and the lexical pass is
+    // the whole of that interpretation, so failure means it escapes the root. Retrying would
+    // resolve it against the process CWD instead, quietly switching interpretation frames:
+    // the same arguments would then mean different files depending on where the command was
+    // run from. It also spends a syscall per path to reach that wrong answer.
+    if !path.is_absolute() {
+        return None;
+    }
+
     let resolved = path.parent()?.canonicalize().ok()?.join(path.file_name()?);
 
     project_relative(canonical_root.unwrap_or(root), &resolved)
@@ -80,7 +90,13 @@ fn lexically_normalize(path: &Path) -> PathBuf {
             Component::CurDir => {}
             Component::ParentDir => {
                 // A `..` that cannot pop is retained, so the caller can detect the escape.
-                if !normalized.pop() {
+                //
+                // A retained `..` must never itself be popped by a later one: `pop()` does
+                // not distinguish it from a real component, so `../../a` cancelled its own
+                // escape and came out as `a` -- reporting an out-of-project path as though
+                // it named a file inside the project.
+                let escaped = matches!(normalized.components().next_back(), Some(Component::ParentDir));
+                if escaped || !normalized.pop() {
                     normalized.push(Component::ParentDir);
                 }
             }
@@ -163,6 +179,38 @@ mod tests {
     #[test]
     fn project_relative_rejects_a_path_escaping_the_root() {
         assert_eq!(project_relative(Path::new("/proj"), Path::new("../outside/a.rb")), None);
+    }
+
+    #[test]
+    fn project_relative_rejects_a_path_escaping_via_repeated_parent_dirs() {
+        // `pop()` does not distinguish a retained `..` from a real component, so this used to
+        // cancel its own escape and come out as `ruby/app/a.rb` -- an out-of-project path
+        // silently reported as though it named a file inside the project.
+        assert_eq!(project_relative(Path::new("/proj"), Path::new("../../ruby/app/a.rb")), None);
+        assert_eq!(project_relative(Path::new("/proj"), Path::new("../../../a.rb")), None);
+    }
+
+    #[test]
+    fn project_relative_rejects_a_path_that_climbs_back_out() {
+        // Interior `..` still pops normally; the escape only has to survive once it starts.
+        assert_eq!(project_relative(Path::new("/proj"), Path::new("ruby/../../a.rb")), None);
+    }
+
+    #[test]
+    fn project_relative_pops_interior_parent_dirs_without_escaping() {
+        let rel = project_relative(Path::new("/proj"), Path::new("ruby/app/models/../../app/a.rb"));
+        assert_eq!(rel, Some(PathBuf::from("ruby/app/a.rb")));
+    }
+
+    #[test]
+    fn resolve_project_relative_does_not_touch_the_filesystem_for_a_relative_path() {
+        // A relative path is project-root-relative by contract, so the lexical pass is the
+        // whole interpretation. Retrying would resolve it against the process CWD, making
+        // the same arguments mean different files depending on where the command was run.
+        assert_eq!(
+            resolve_project_relative(Path::new("/proj"), Some(Path::new("/proj")), Path::new("../outside/a.rb")),
+            None
+        );
     }
 
     #[test]
