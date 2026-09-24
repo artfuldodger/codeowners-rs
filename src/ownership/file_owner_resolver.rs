@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use fast_glob::glob_match;
 use glob::glob;
+use memoize::memoize;
 
 use crate::{config::Config, project::Team, project_file_builder::build_project_file_without_cache};
 
@@ -19,8 +21,9 @@ pub fn find_file_owners(project_root: &Path, config: &Config, file_path: &Path) 
     };
     let relative_file_path = crate::path_utils::relative_to_buf(project_root, &absolute_file_path);
 
-    let teams = load_teams(project_root, &config.team_file_glob)?;
-    let teams_by_name = build_teams_by_name_map(&teams);
+    let loaded = loaded_teams(project_root.to_path_buf(), config.team_file_glob.clone())?;
+    let teams = &loaded.teams;
+    let teams_by_name = &loaded.teams_by_name;
 
     let mut sources_by_team: HashMap<String, Vec<Source>> = HashMap::new();
 
@@ -38,20 +41,20 @@ pub fn find_file_owners(project_root: &Path, config: &Config, file_path: &Path) 
         }
     }
 
-    if let Some((owner_team_name, dir_source)) = most_specific_directory_owner(project_root, &relative_file_path, &teams_by_name) {
+    if let Some((owner_team_name, dir_source)) = most_specific_directory_owner(project_root, &relative_file_path, teams_by_name) {
         sources_by_team.entry(owner_team_name).or_default().push(dir_source);
     }
 
-    if let Some((owner_team_name, package_source)) = nearest_package_owner(project_root, &relative_file_path, config, &teams_by_name) {
+    if let Some((owner_team_name, package_source)) = nearest_package_owner(project_root, &relative_file_path, config, teams_by_name) {
         sources_by_team.entry(owner_team_name).or_default().push(package_source);
     }
 
-    if let Some((owner_team_name, gem_source)) = vendored_gem_owner(&relative_file_path, config, &teams) {
+    if let Some((owner_team_name, gem_source)) = vendored_gem_owner(&relative_file_path, config, teams) {
         sources_by_team.entry(owner_team_name).or_default().push(gem_source);
     }
 
     if let Some(rel_str) = relative_file_path.to_str() {
-        for team in &teams {
+        for team in teams {
             let subtracts: HashSet<&str> = team.subtracted_globs.iter().map(|s| s.as_str()).collect();
             for owned_glob in &team.owned_globs {
                 if glob_match(owned_glob, rel_str) && !subtracts.iter().any(|sub| glob_match(sub, rel_str)) {
@@ -64,7 +67,7 @@ pub fn find_file_owners(project_root: &Path, config: &Config, file_path: &Path) 
         }
     }
 
-    for team in &teams {
+    for team in teams {
         let team_rel = crate::path_utils::relative_to_buf(project_root, &team.path);
         if team_rel == relative_file_path {
             sources_by_team.entry(team.name.clone()).or_default().push(Source::TeamYml);
@@ -96,6 +99,25 @@ pub fn find_file_owners(project_root: &Path, config: &Config, file_path: &Path) 
     }
 
     Ok(file_owners)
+}
+
+struct LoadedTeams {
+    teams: Vec<Team>,
+    teams_by_name: HashMap<String, Team>,
+}
+
+// Parsing every team file dominates a lookup, so load them once per project root and glob list for the
+// life of the process, as teams_by_github_team_name does for CODEOWNERS lookups.
+#[memoize]
+fn loaded_teams(project_root: PathBuf, team_file_globs: Vec<String>) -> std::result::Result<Arc<LoadedTeams>, String> {
+    let teams = load_teams(&project_root, &team_file_globs)?;
+    let teams_by_name = build_teams_by_name_map(&teams);
+    Ok(Arc::new(LoadedTeams { teams, teams_by_name }))
+}
+
+/// Drops the teams memoized by `find_file_owners`, for callers whose team files change within one process.
+pub fn clear_team_cache() {
+    memoized_flush_loaded_teams();
 }
 
 fn build_teams_by_name_map(teams: &[Team]) -> HashMap<String, Team> {
@@ -503,5 +525,40 @@ mod tests {
         let result = vendored_gem_owner(path, &config, &teams).unwrap();
         assert_eq!(result.0, "Payroll");
         matches!(result.1, Source::TeamGem);
+    }
+
+    #[test]
+    fn test_find_file_owners_reuses_loaded_teams_until_cleared() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        let config = build_config_for_temp("frontend/**/*", "packs/**/*", "vendored");
+        let write_team = |glob: &str| {
+            fs::create_dir_all(root.join("config/teams")).unwrap();
+            fs::write(
+                root.join("config/teams/payroll.yml"),
+                format!("name: Payroll\ngithub:\n  team: '@PayrollTeam'\nowned_globs:\n  - {glob}\n"),
+            )
+            .unwrap();
+        };
+        let owner_of = |file: &str| {
+            find_file_owners(root, &config, Path::new(file))
+                .unwrap()
+                .first()
+                .map(|owner| owner.team.name.clone())
+        };
+
+        write_team("app/payroll/**/*");
+        assert_eq!(owner_of("app/payroll/a.rb"), Some("Payroll".to_string()));
+
+        write_team("app/other/**/*");
+        assert_eq!(
+            owner_of("app/payroll/a.rb"),
+            Some("Payroll".to_string()),
+            "team files are loaded once per process"
+        );
+
+        clear_team_cache();
+        assert_eq!(owner_of("app/payroll/a.rb"), None);
+        assert_eq!(owner_of("app/other/a.rb"), Some("Payroll".to_string()));
     }
 }
