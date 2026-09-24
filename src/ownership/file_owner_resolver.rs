@@ -21,7 +21,7 @@ pub fn find_file_owners(project_root: &Path, config: &Config, file_path: &Path) 
     };
     let relative_file_path = crate::path_utils::relative_to_buf(project_root, &absolute_file_path);
 
-    let loaded = loaded_teams(project_root.to_path_buf(), config.team_file_glob.clone())?;
+    let loaded = loaded_teams(teams_cache_root(project_root), config.team_file_glob.clone())?;
     let teams = &loaded.teams;
     let teams_by_name = &loaded.teams_by_name;
 
@@ -107,12 +107,18 @@ struct LoadedTeams {
 }
 
 // Parsing every team file dominates a lookup, so load them once per project root and glob list for the
-// life of the process, as teams_by_github_team_name does for CODEOWNERS lookups.
-#[memoize]
+// life of the process. SharedCache makes that one load per process rather than per thread, and lets
+// clear_team_cache clear it for every thread.
+#[memoize(SharedCache)]
 fn loaded_teams(project_root: PathBuf, team_file_globs: Vec<String>) -> std::result::Result<Arc<LoadedTeams>, String> {
     let teams = load_teams(&project_root, &team_file_globs)?;
     let teams_by_name = build_teams_by_name_map(&teams);
     Ok(Arc::new(LoadedTeams { teams, teams_by_name }))
+}
+
+// Keyed on the absolute root so a relative root isn't reused after the working directory changes.
+fn teams_cache_root(project_root: &Path) -> PathBuf {
+    std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf())
 }
 
 /// Drops the teams memoized by `find_file_owners`, for callers whose team files change within one process.
@@ -528,7 +534,19 @@ mod tests {
     }
 
     #[test]
+    fn test_teams_cache_root_is_absolute_for_relative_roots() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(teams_cache_root(Path::new("some/project")), cwd.join("some/project"));
+        assert_eq!(teams_cache_root(Path::new(".")), cwd.join("."));
+        assert_eq!(teams_cache_root(&cwd), cwd);
+    }
+
+    // The team cache is process-wide, so tests that clear it must not interleave.
+    static TEAM_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
     fn test_find_file_owners_reuses_loaded_teams_until_cleared() {
+        let _guard = TEAM_CACHE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let td = tempdir().unwrap();
         let root = td.path();
         let config = build_config_for_temp("frontend/**/*", "packs/**/*", "vendored");
@@ -560,5 +578,48 @@ mod tests {
         clear_team_cache();
         assert_eq!(owner_of("app/payroll/a.rb"), None);
         assert_eq!(owner_of("app/other/a.rb"), Some("Payroll".to_string()));
+    }
+
+    #[test]
+    fn test_find_file_owners_shares_loaded_teams_across_threads() {
+        let _guard = TEAM_CACHE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let td = tempdir().unwrap();
+        let root = td.path().to_path_buf();
+        let config = build_config_for_temp("frontend/**/*", "packs/**/*", "vendored");
+        let write_team = |glob: &str| {
+            fs::create_dir_all(root.join("config/teams")).unwrap();
+            fs::write(
+                root.join("config/teams/payroll.yml"),
+                format!("name: Payroll\ngithub:\n  team: '@PayrollTeam'\nowned_globs:\n  - {glob}\n"),
+            )
+            .unwrap();
+        };
+        let owner_of = |root: &Path, config: &crate::config::Config, file: &str| {
+            find_file_owners(root, config, Path::new(file))
+                .unwrap()
+                .first()
+                .map(|owner| owner.team.name.clone())
+        };
+
+        write_team("app/payroll/**/*");
+        assert_eq!(owner_of(&root, &config, "app/payroll/a.rb"), Some("Payroll".to_string()));
+        write_team("app/other/**/*");
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(
+                    owner_of(&root, &config, "app/payroll/a.rb"),
+                    Some("Payroll".to_string()),
+                    "another thread reuses the teams loaded by the first"
+                );
+                clear_team_cache();
+            });
+        });
+
+        assert_eq!(
+            owner_of(&root, &config, "app/payroll/a.rb"),
+            None,
+            "a clear on another thread applies here too"
+        );
     }
 }
