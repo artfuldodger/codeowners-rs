@@ -2,12 +2,11 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
 };
 
 use fast_glob::glob_match;
 use glob::glob;
-use memoize::memoize;
 
 use crate::{config::Config, project::Team, project_file_builder::build_project_file_without_cache};
 
@@ -106,14 +105,33 @@ struct LoadedTeams {
     teams_by_name: HashMap<String, Team>,
 }
 
-// Parsing every team file dominates a lookup, so load them once per project root and glob list for the
-// life of the process. SharedCache makes that one load per process rather than per thread, and lets
-// clear_team_cache clear it for every thread.
-#[memoize(SharedCache)]
+type TeamCacheKey = (PathBuf, Vec<String>);
+
+// Parsing every team file dominates a lookup, so load them once per project root and glob list and share
+// the result across threads for the life of the process.
+static TEAM_CACHE: LazyLock<Mutex<HashMap<TeamCacheKey, Arc<LoadedTeams>>>> = LazyLock::new(Default::default);
+
+fn team_cache() -> MutexGuard<'static, HashMap<TeamCacheKey, Arc<LoadedTeams>>> {
+    TEAM_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn loaded_teams(project_root: PathBuf, team_file_globs: Vec<String>) -> std::result::Result<Arc<LoadedTeams>, String> {
-    let teams = load_teams(&project_root, &team_file_globs)?;
-    let teams_by_name = build_teams_by_name_map(&teams);
-    Ok(Arc::new(LoadedTeams { teams, teams_by_name }))
+    let key = (project_root, team_file_globs);
+    if let Some(loaded) = team_cache().get(&key) {
+        return Ok(Arc::clone(loaded));
+    }
+
+    let load = load_teams(&key.0, &key.1)?;
+    let teams_by_name = build_teams_by_name_map(&load.teams);
+    let loaded = Arc::new(LoadedTeams {
+        teams: load.teams,
+        teams_by_name,
+    });
+    // A load that skipped a team file isn't cached, so fixing the file takes effect on the next lookup.
+    if !load.skipped_team_file {
+        team_cache().insert(key, Arc::clone(&loaded));
+    }
+    Ok(loaded)
 }
 
 // Keyed on the absolute root so a relative root isn't reused after the working directory changes.
@@ -123,7 +141,7 @@ fn teams_cache_root(project_root: &Path) -> PathBuf {
 
 /// Drops the teams memoized by `find_file_owners`, for callers whose team files change within one process.
 pub fn clear_team_cache() {
-    memoized_flush_loaded_teams();
+    team_cache().clear();
 }
 
 fn build_teams_by_name_map(teams: &[Team]) -> HashMap<String, Team> {
@@ -135,22 +153,36 @@ fn build_teams_by_name_map(teams: &[Team]) -> HashMap<String, Team> {
     map
 }
 
-fn load_teams(project_root: &Path, team_file_globs: &[String]) -> std::result::Result<Vec<Team>, String> {
+struct TeamLoad {
+    teams: Vec<Team>,
+    skipped_team_file: bool,
+}
+
+fn load_teams(project_root: &Path, team_file_globs: &[String]) -> std::result::Result<TeamLoad, String> {
     let mut teams: Vec<Team> = Vec::new();
+    let mut skipped_team_file = false;
     for glob_str in team_file_globs {
         let absolute_glob = project_root.join(glob_str).to_string_lossy().into_owned();
         let paths = glob(&absolute_glob).map_err(|e| e.to_string())?;
-        for path in paths.flatten() {
+        for entry in paths {
+            let path = match entry {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("Error reading team file path: {e}");
+                    skipped_team_file = true;
+                    continue;
+                }
+            };
             match Team::from_team_file_path(path.clone()) {
                 Ok(team) => teams.push(team),
                 Err(e) => {
                     eprintln!("Error parsing team file: {e:?}, path: {}", path.display());
-                    continue;
+                    skipped_team_file = true;
                 }
             }
         }
     }
-    Ok(teams)
+    Ok(TeamLoad { teams, skipped_team_file })
 }
 
 fn read_top_of_file_team(path: &Path) -> Option<String> {
@@ -621,5 +653,81 @@ mod tests {
             None,
             "a clear on another thread applies here too"
         );
+    }
+
+    #[test]
+    fn test_find_file_owners_does_not_cache_a_load_that_skipped_a_team_file() {
+        let _guard = TEAM_CACHE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let td = tempdir().unwrap();
+        let root = td.path();
+        let config = build_config_for_temp("frontend/**/*", "packs/**/*", "vendored");
+        let write_team_file = |file: &str, contents: &str| {
+            fs::create_dir_all(root.join("config/teams")).unwrap();
+            fs::write(root.join("config/teams").join(file), contents).unwrap();
+        };
+        let owner_of = |file: &str| {
+            find_file_owners(root, &config, Path::new(file))
+                .unwrap()
+                .first()
+                .map(|owner| owner.team.name.clone())
+        };
+
+        write_team_file(
+            "payroll.yml",
+            "name: Payroll\ngithub:\n  team: '@PayrollTeam'\nowned_globs:\n  - app/payroll/**/*\n",
+        );
+        write_team_file("billing.yml", "name: [unclosed\n");
+        assert_eq!(owner_of("app/payroll/a.rb"), Some("Payroll".to_string()));
+        assert_eq!(owner_of("app/billing/a.rb"), None);
+
+        write_team_file(
+            "billing.yml",
+            "name: Billing\ngithub:\n  team: '@BillingTeam'\nowned_globs:\n  - app/billing/**/*\n",
+        );
+        assert_eq!(
+            owner_of("app/billing/a.rb"),
+            Some("Billing".to_string()),
+            "fixing the team file takes effect without clearing the cache"
+        );
+
+        write_team_file(
+            "billing.yml",
+            "name: Billing\ngithub:\n  team: '@BillingTeam'\nowned_globs:\n  - app/other/**/*\n",
+        );
+        assert_eq!(
+            owner_of("app/billing/a.rb"),
+            Some("Billing".to_string()),
+            "once every team file loads, the teams are cached"
+        );
+    }
+
+    #[test]
+    fn test_team_cache_is_keyed_on_team_file_glob() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        for (dir, name) in [("a", "Payroll"), ("b", "Billing")] {
+            fs::create_dir_all(root.join("config/teams").join(dir)).unwrap();
+            fs::write(
+                root.join("config/teams").join(dir).join("team.yml"),
+                format!("name: {name}\ngithub:\n  team: '@{name}Team'\nowned_globs:\n  - app/**/*\n"),
+            )
+            .unwrap();
+        }
+        let config_with_team_glob = |team_glob: &str| crate::config::Config {
+            team_file_glob: vec![team_glob.to_string()],
+            ..build_config_for_temp("frontend/**/*", "packs/**/*", "vendored")
+        };
+        let config_a = config_with_team_glob("config/teams/a/*.yml");
+        let config_b = config_with_team_glob("config/teams/b/*.yml");
+        let owner_of = |config: &crate::config::Config| {
+            find_file_owners(root, config, Path::new("app/a.rb"))
+                .unwrap()
+                .first()
+                .map(|owner| owner.team.name.clone())
+        };
+
+        assert_eq!(owner_of(&config_a), Some("Payroll".to_string()));
+        assert_eq!(owner_of(&config_b), Some("Billing".to_string()));
+        assert_eq!(owner_of(&config_a), Some("Payroll".to_string()));
     }
 }
