@@ -109,17 +109,28 @@ type TeamCacheKey = (PathBuf, Vec<String>);
 
 // Parsing every team file dominates a lookup, so load them once per project root and glob list and share
 // the result across threads for the life of the process.
-static TEAM_CACHE: LazyLock<Mutex<HashMap<TeamCacheKey, Arc<LoadedTeams>>>> = LazyLock::new(Default::default);
+static TEAM_CACHE: LazyLock<Mutex<TeamCache>> = LazyLock::new(Default::default);
 
-fn team_cache() -> MutexGuard<'static, HashMap<TeamCacheKey, Arc<LoadedTeams>>> {
+#[derive(Default)]
+struct TeamCache {
+    // Bumped by `clear_team_cache` so a load already running during a clear can't reinstate its stale result.
+    generation: u64,
+    loaded: HashMap<TeamCacheKey, Arc<LoadedTeams>>,
+}
+
+fn team_cache() -> MutexGuard<'static, TeamCache> {
     TEAM_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn loaded_teams(project_root: PathBuf, team_file_globs: Vec<String>) -> std::result::Result<Arc<LoadedTeams>, String> {
     let key = (project_root, team_file_globs);
-    if let Some(loaded) = team_cache().get(&key) {
-        return Ok(Arc::clone(loaded));
-    }
+    let generation = {
+        let cache = team_cache();
+        if let Some(loaded) = cache.loaded.get(&key) {
+            return Ok(Arc::clone(loaded));
+        }
+        cache.generation
+    };
 
     let load = load_teams(&key.0, &key.1)?;
     let teams_by_name = build_teams_by_name_map(&load.teams);
@@ -129,9 +140,16 @@ fn loaded_teams(project_root: PathBuf, team_file_globs: Vec<String>) -> std::res
     });
     // A load that skipped a team file isn't cached, so fixing the file takes effect on the next lookup.
     if !load.skipped_team_file {
-        team_cache().insert(key, Arc::clone(&loaded));
+        cache_teams(key, Arc::clone(&loaded), generation);
     }
     Ok(loaded)
+}
+
+fn cache_teams(key: TeamCacheKey, loaded: Arc<LoadedTeams>, generation: u64) {
+    let mut cache = team_cache();
+    if cache.generation == generation {
+        cache.loaded.insert(key, loaded);
+    }
 }
 
 // Keyed on the absolute root so a relative root isn't reused after the working directory changes.
@@ -141,7 +159,9 @@ fn teams_cache_root(project_root: &Path) -> PathBuf {
 
 /// Drops the teams memoized by `find_file_owners`, for callers whose team files change within one process.
 pub fn clear_team_cache() {
-    team_cache().clear();
+    let mut cache = team_cache();
+    cache.generation += 1;
+    cache.loaded.clear();
 }
 
 fn build_teams_by_name_map(teams: &[Team]) -> HashMap<String, Team> {
@@ -653,6 +673,82 @@ mod tests {
             None,
             "a clear on another thread applies here too"
         );
+    }
+
+    #[test]
+    fn test_clear_team_cache_during_a_load_is_not_undone_by_its_result() {
+        let _guard = TEAM_CACHE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key: TeamCacheKey = (PathBuf::from("/clear-during-load"), vec!["config/teams/**/*.yml".to_string()]);
+        let loaded = || {
+            Arc::new(LoadedTeams {
+                teams: Vec::new(),
+                teams_by_name: HashMap::new(),
+            })
+        };
+
+        let generation = team_cache().generation;
+        clear_team_cache();
+        cache_teams(key.clone(), loaded(), generation);
+        assert!(
+            !team_cache().loaded.contains_key(&key),
+            "a load that started before the clear must not be cached"
+        );
+
+        let generation = team_cache().generation;
+        cache_teams(key.clone(), loaded(), generation);
+        assert!(team_cache().loaded.contains_key(&key));
+        clear_team_cache();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_file_owners_does_not_cache_a_load_with_an_unreadable_team_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = TEAM_CACHE_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let td = tempdir().unwrap();
+        let root = td.path();
+        let config = build_config_for_temp("frontend/**/*", "packs/**/*", "vendored");
+        let owner_of = |file: &str| {
+            find_file_owners(root, &config, Path::new(file))
+                .unwrap()
+                .first()
+                .map(|owner| owner.team.name.clone())
+        };
+
+        let teams_dir = root.join("config/teams");
+        let locked_dir = teams_dir.join("billing");
+        fs::create_dir_all(&locked_dir).unwrap();
+        fs::write(
+            teams_dir.join("payroll.yml"),
+            "name: Payroll\ngithub:\n  team: '@PayrollTeam'\nowned_globs:\n  - app/payroll/**/*\n",
+        )
+        .unwrap();
+        fs::write(
+            locked_dir.join("billing.yml"),
+            "name: Billing\ngithub:\n  team: '@BillingTeam'\nowned_globs:\n  - app/billing/**/*\n",
+        )
+        .unwrap();
+
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        // Permissions aren't enforced for root, so the directory can't be made unreadable there.
+        if fs::read_dir(&locked_dir).is_ok() {
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let payroll = owner_of("app/payroll/a.rb");
+        let billing_while_unreadable = owner_of("app/billing/a.rb");
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let billing_once_readable = owner_of("app/billing/a.rb");
+
+        assert_eq!(payroll, Some("Payroll".to_string()));
+        assert_eq!(billing_while_unreadable, None);
+        assert_eq!(
+            billing_once_readable,
+            Some("Billing".to_string()),
+            "a team directory that becomes readable takes effect without clearing the cache"
+        );
+        clear_team_cache();
     }
 
     #[test]
